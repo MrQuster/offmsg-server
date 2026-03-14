@@ -221,6 +221,47 @@ def websocket(ws):
             except Exception:
                 pass
 
+
+@app.route('/send', methods=['POST'])
+def send_msg():
+    d         = request.json or {}
+    sender    = d.get('sender')
+    recipient = d.get('recipient')
+    text      = (d.get('text') or '').strip()
+    if not text or not sender or not recipient:
+        return jsonify({'ok': False})
+    m = Message(sender=sender, recipient=recipient, text=text)
+    db.session.add(m)
+    db.session.commit()
+    payload = {'id': m.id, 'sender': sender, 'recipient': recipient,
+               'text': text, 'timestamp': m.timestamp.isoformat()}
+    send_to(recipient, {'event': 'new_message',  'data': payload})
+    send_to(sender,    {'event': 'message_sent', 'data': payload})
+    return jsonify({'ok': True, 'id': m.id})
+
+
+@app.after_request
+def add_cors(response):
+    response.headers['Access-Control-Allow-Origin']  = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET,POST,DELETE,OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    return response
+
+@app.route('/', defaults={'path': ''}, methods=['OPTIONS'])
+@app.route('/<path:path>', methods=['OPTIONS'])
+def options(path):
+    from flask import Response
+    return Response('', status=200, headers={
+        'Access-Control-Allow-Origin':  '*',
+        'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type'
+    })
+
+
+@app.route('/app')
+def web_app():
+    return send_from_directory('static', 'index.html')
+
 with app.app_context():
     db.create_all()
 
