@@ -1,13 +1,11 @@
 """
-OffMsg Server для Railway
+OffMsg Server v2 — с поддержкой файлов и удаления аккаунта
 """
-
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_socketio import SocketIO, emit, join_room
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime
-import bcrypt
-import os
+import bcrypt, os
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'offmsg-secret-2024')
@@ -16,8 +14,10 @@ if app.config['SQLALCHEMY_DATABASE_URI'].startswith('postgres://'):
     app.config['SQLALCHEMY_DATABASE_URI'] = app.config['SQLALCHEMY_DATABASE_URI'].replace('postgres://', 'postgresql://', 1)
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
+UPLOAD_FOLDER = 'uploads'
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
 db = SQLAlchemy(app)
-# threading — работает на любом Python без доп. пакетов
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 class User(db.Model):
@@ -42,7 +42,7 @@ online_users = {}
 
 @app.route('/')
 def index():
-    return jsonify({'status': 'OffMsg server running ✓'})
+    return jsonify({'status': 'OffMsg server v2 ✓'})
 
 @app.route('/register', methods=['POST'])
 def register():
@@ -74,6 +74,17 @@ def login():
         return jsonify({'ok': False, 'error': 'Неверный пароль'})
     return jsonify({'ok': True, 'username': username})
 
+@app.route('/account', methods=['DELETE'])
+def delete_account():
+    username = request.args.get('username') or (request.json or {}).get('username')
+    if not username:
+        return jsonify({'ok': False, 'error': 'Не указан пользователь'})
+    User.query.filter_by(username=username).delete()
+    Message.query.filter((Message.sender == username) | (Message.recipient == username)).delete()
+    Contact.query.filter((Contact.owner == username) | (Contact.contact == username)).delete()
+    db.session.commit()
+    return jsonify({'ok': True})
+
 @app.route('/history')
 def history():
     me = request.args.get('me')
@@ -95,10 +106,7 @@ def history():
 def get_contacts():
     owner = request.args.get('username')
     contacts = Contact.query.filter_by(owner=owner).all()
-    return jsonify([{
-        'username': c.contact,
-        'online': c.contact in online_users
-    } for c in contacts])
+    return jsonify([{'username': c.contact, 'online': c.contact in online_users} for c in contacts])
 
 @app.route('/contacts/add', methods=['POST'])
 def add_contact():
@@ -123,6 +131,36 @@ def unread():
     for m in msgs:
         counts[m.sender] = counts.get(m.sender, 0) + 1
     return jsonify(counts)
+
+@app.route('/upload', methods=['POST'])
+def upload():
+    sender = request.form.get('sender')
+    recipient = request.form.get('recipient')
+    file = request.files.get('file')
+    if not file or not sender or not recipient:
+        return jsonify({'ok': False, 'error': 'Неверные данные'}), 400
+
+    safe_name = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{file.filename}"
+    file.save(os.path.join(UPLOAD_FOLDER, safe_name))
+
+    msg = Message(sender=sender, recipient=recipient, text=f"[FILE]{safe_name}")
+    db.session.add(msg)
+    db.session.commit()
+
+    payload = {
+        'id': msg.id, 'sender': sender, 'recipient': recipient,
+        'text': msg.text, 'timestamp': msg.timestamp.isoformat()
+    }
+    if recipient in online_users:
+        socketio.emit('new_message', payload, room=recipient)
+    if sender in online_users:
+        socketio.emit('message_sent', payload, room=sender)
+
+    return jsonify({'ok': True, 'filename': safe_name})
+
+@app.route('/files/<filename>')
+def get_file(filename):
+    return send_from_directory(UPLOAD_FOLDER, filename)
 
 @socketio.on('auth')
 def on_auth(data):
@@ -159,10 +197,8 @@ def on_message(data):
     msg = Message(sender=sender, recipient=recipient, text=text)
     db.session.add(msg)
     db.session.commit()
-    payload = {
-        'id': msg.id, 'sender': sender, 'recipient': recipient,
-        'text': text, 'timestamp': msg.timestamp.isoformat()
-    }
+    payload = {'id': msg.id, 'sender': sender, 'recipient': recipient,
+               'text': text, 'timestamp': msg.timestamp.isoformat()}
     if recipient in online_users:
         emit('new_message', payload, room=recipient)
     emit('message_sent', payload, room=sender)
