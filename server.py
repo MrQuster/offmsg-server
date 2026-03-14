@@ -1,5 +1,5 @@
 """
-OffMsg Server v3 - Flask + flask-sock (чистый WebSocket)
+OffMsg Server v4 - исправлен push сообщений и статус онлайн
 """
 from flask import Flask, request, jsonify, send_from_directory
 from flask_sock import Sock
@@ -22,6 +22,7 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 db = SQLAlchemy(app)
 
+# ── Models ──────────────────────────────────────────
 class User(db.Model):
     id            = db.Column(db.Integer, primary_key=True)
     username      = db.Column(db.String(32), unique=True, nullable=False)
@@ -40,24 +41,58 @@ class Contact(db.Model):
     owner   = db.Column(db.String(32), nullable=False)
     contact = db.Column(db.String(32), nullable=False)
 
+# ── Online users ────────────────────────────────────
 _lock   = threading.Lock()
-_online = {}
+_online = {}  # username -> ws
 
-def send_to(username, data):
+def push(username, data):
+    """Отправить данные пользователю если онлайн"""
     with _lock:
         ws = _online.get(username)
-    if ws:
-        try:
-            ws.send(json.dumps(data))
-            return True
-        except Exception:
-            with _lock:
-                _online.pop(username, None)
-    return False
+    if not ws:
+        return False
+    try:
+        ws.send(json.dumps(data, ensure_ascii=False))
+        return True
+    except Exception:
+        with _lock:
+            _online.pop(username, None)
+        return False
 
+def notify_contacts_status(username, online):
+    """Уведомить все контакты об изменении статуса"""
+    try:
+        contacts = Contact.query.filter_by(contact=username).all()
+        ev = 'contact_online' if online else 'contact_offline'
+        for c in contacts:
+            push(c.owner, {'event': ev, 'data': {'username': username}})
+    except Exception:
+        pass
+
+# ── CORS ────────────────────────────────────────────
+@app.after_request
+def cors(r):
+    r.headers['Access-Control-Allow-Origin']  = '*'
+    r.headers['Access-Control-Allow-Methods'] = 'GET,POST,DELETE,OPTIONS'
+    r.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    return r
+
+@app.route('/', defaults={'p': ''}, methods=['OPTIONS'])
+@app.route('/<path:p>', methods=['OPTIONS'])
+def options(p):
+    from flask import Response
+    return Response('', 200, {
+        'Access-Control-Allow-Origin':  '*',
+        'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type'
+    })
+
+# ── HTTP routes ─────────────────────────────────────
 @app.route('/')
 def index():
-    return jsonify({'status': 'OffMsg v3', 'online': len(_online)})
+    with _lock:
+        cnt = len(_online)
+    return jsonify({'status': 'OffMsg v4', 'online': cnt})
 
 @app.route('/register', methods=['POST'])
 def register():
@@ -120,9 +155,11 @@ def history():
 @app.route('/contacts')
 def get_contacts():
     owner = request.args.get('username')
+    with _lock:
+        online_now = set(_online.keys())
     return jsonify([{
         'username': c.contact,
-        'online':   c.contact in _online
+        'online':   c.contact in online_now
     } for c in Contact.query.filter_by(owner=owner).all()])
 
 @app.route('/contacts/add', methods=['POST'])
@@ -138,7 +175,9 @@ def add_contact():
         return jsonify({'ok': False, 'error': 'Уже в контактах'})
     db.session.add(Contact(owner=owner, contact=contact))
     db.session.commit()
-    return jsonify({'ok': True, 'online': contact in _online})
+    with _lock:
+        is_online = contact in _online
+    return jsonify({'ok': True, 'online': is_online})
 
 @app.route('/unread')
 def unread():
@@ -148,6 +187,27 @@ def unread():
     for m in msgs:
         counts[m.sender] = counts.get(m.sender, 0) + 1
     return jsonify(counts)
+
+@app.route('/send', methods=['POST'])
+def send_http():
+    """HTTP fallback для отправки сообщений"""
+    d         = request.json or {}
+    sender    = d.get('sender')
+    recipient = d.get('recipient')
+    text      = (d.get('text') or '').strip()
+    if not text or not sender or not recipient:
+        return jsonify({'ok': False})
+    m = Message(sender=sender, recipient=recipient, text=text)
+    db.session.add(m)
+    db.session.commit()
+    payload = {
+        'id': m.id, 'sender': sender, 'recipient': recipient,
+        'text': text, 'timestamp': m.timestamp.isoformat()
+    }
+    # Push через WebSocket немедленно
+    push(recipient, {'event': 'new_message',  'data': payload})
+    push(sender,    {'event': 'message_sent', 'data': payload})
+    return jsonify({'ok': True, 'id': m.id})
 
 @app.route('/upload', methods=['POST'])
 def upload():
@@ -161,16 +221,23 @@ def upload():
     m = Message(sender=sender, recipient=recipient, text=f'[FILE]{safe}')
     db.session.add(m)
     db.session.commit()
-    payload = {'id': m.id, 'sender': sender, 'recipient': recipient,
-               'text': m.text, 'timestamp': m.timestamp.isoformat()}
-    send_to(recipient, {'event': 'new_message',  'data': payload})
-    send_to(sender,    {'event': 'message_sent', 'data': payload})
+    payload = {
+        'id': m.id, 'sender': sender, 'recipient': recipient,
+        'text': m.text, 'timestamp': m.timestamp.isoformat()
+    }
+    push(recipient, {'event': 'new_message',  'data': payload})
+    push(sender,    {'event': 'message_sent', 'data': payload})
     return jsonify({'ok': True, 'filename': safe})
 
 @app.route('/files/<filename>')
 def get_file(filename):
     return send_from_directory(UPLOAD_FOLDER, filename)
 
+@app.route('/app')
+def web_app():
+    return send_from_directory('static', 'index.html')
+
+# ── WebSocket ────────────────────────────────────────
 @sock.route('/ws')
 def websocket(ws):
     username = None
@@ -184,30 +251,44 @@ def websocket(ws):
             except Exception:
                 continue
 
-            event = msg.get('event')
+            ev = msg.get('event')
 
-            if event == 'auth':
-                username = msg.get('username')
+            if ev == 'auth':
+                username = msg.get('username', '').strip()
                 if not username:
                     continue
                 with _lock:
                     _online[username] = ws
-                for c in Contact.query.filter_by(contact=username).all():
-                    send_to(c.owner, {'event': 'contact_online', 'data': {'username': username}})
+                # Уведомить контакты что онлайн
+                notify_contacts_status(username, True)
+                # Подтвердить подключение
+                try:
+                    ws.send(json.dumps({'event': 'auth_ok', 'data': {'username': username}}))
+                except Exception:
+                    pass
 
-            elif event == 'send_message':
-                sender    = msg.get('sender')
-                recipient = msg.get('recipient')
+            elif ev == 'send_message':
+                sender    = msg.get('sender', '').strip()
+                recipient = msg.get('recipient', '').strip()
                 text      = (msg.get('text') or '').strip()
                 if not text or not sender or not recipient:
                     continue
                 m = Message(sender=sender, recipient=recipient, text=text)
                 db.session.add(m)
                 db.session.commit()
-                payload = {'id': m.id, 'sender': sender, 'recipient': recipient,
-                           'text': text, 'timestamp': m.timestamp.isoformat()}
-                send_to(recipient, {'event': 'new_message',  'data': payload})
-                send_to(sender,    {'event': 'message_sent', 'data': payload})
+                payload = {
+                    'id': m.id, 'sender': sender, 'recipient': recipient,
+                    'text': text, 'timestamp': m.timestamp.isoformat()
+                }
+                # Немедленно пушим обоим
+                push(recipient, {'event': 'new_message',  'data': payload})
+                push(sender,    {'event': 'message_sent', 'data': payload})
+
+            elif ev == 'ping':
+                try:
+                    ws.send(json.dumps({'event': 'pong'}))
+                except Exception:
+                    break
 
     except Exception:
         pass
@@ -215,53 +296,9 @@ def websocket(ws):
         if username:
             with _lock:
                 _online.pop(username, None)
-            try:
-                for c in Contact.query.filter_by(contact=username).all():
-                    send_to(c.owner, {'event': 'contact_offline', 'data': {'username': username}})
-            except Exception:
-                pass
+            notify_contacts_status(username, False)
 
-
-@app.route('/send', methods=['POST'])
-def send_msg():
-    d         = request.json or {}
-    sender    = d.get('sender')
-    recipient = d.get('recipient')
-    text      = (d.get('text') or '').strip()
-    if not text or not sender or not recipient:
-        return jsonify({'ok': False})
-    m = Message(sender=sender, recipient=recipient, text=text)
-    db.session.add(m)
-    db.session.commit()
-    payload = {'id': m.id, 'sender': sender, 'recipient': recipient,
-               'text': text, 'timestamp': m.timestamp.isoformat()}
-    send_to(recipient, {'event': 'new_message',  'data': payload})
-    send_to(sender,    {'event': 'message_sent', 'data': payload})
-    return jsonify({'ok': True, 'id': m.id})
-
-
-@app.after_request
-def add_cors(response):
-    response.headers['Access-Control-Allow-Origin']  = '*'
-    response.headers['Access-Control-Allow-Methods'] = 'GET,POST,DELETE,OPTIONS'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
-    return response
-
-@app.route('/', defaults={'path': ''}, methods=['OPTIONS'])
-@app.route('/<path:path>', methods=['OPTIONS'])
-def options(path):
-    from flask import Response
-    return Response('', status=200, headers={
-        'Access-Control-Allow-Origin':  '*',
-        'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type'
-    })
-
-
-@app.route('/app')
-def web_app():
-    return send_from_directory('static', 'index.html')
-
+# ── Init ─────────────────────────────────────────────
 with app.app_context():
     db.create_all()
 
