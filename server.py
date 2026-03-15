@@ -291,6 +291,41 @@ def websocket(ws):
                 except Exception:
                     break
 
+            # ── WebRTC Call Signaling ──────────────────
+            elif ev == 'call_offer':
+                # Caller sends offer SDP to recipient
+                caller    = msg.get('caller', '').strip()
+                recipient = msg.get('recipient', '').strip()
+                sdp       = msg.get('sdp', '')
+                call_type = msg.get('call_type', 'voice')  # voice / video
+                if caller and recipient and sdp:
+                    push(recipient, {
+                        'event': 'call_offer',
+                        'data': {'caller': caller, 'sdp': sdp, 'call_type': call_type}
+                    })
+
+            elif ev == 'call_answer':
+                caller = msg.get('caller', '').strip()
+                sdp    = msg.get('sdp', '')
+                if caller and sdp:
+                    push(caller, {'event': 'call_answer', 'data': {'sdp': sdp, 'from': username}})
+
+            elif ev == 'call_ice':
+                target    = msg.get('target', '').strip()
+                candidate = msg.get('candidate')
+                if target and candidate:
+                    push(target, {'event': 'call_ice', 'data': {'candidate': candidate, 'from': username}})
+
+            elif ev == 'call_reject':
+                caller = msg.get('caller', '').strip()
+                if caller:
+                    push(caller, {'event': 'call_rejected', 'data': {'by': username}})
+
+            elif ev == 'call_end':
+                target = msg.get('target', '').strip()
+                if target:
+                    push(target, {'event': 'call_ended', 'data': {'by': username}})
+
     except Exception:
         pass
     finally:
